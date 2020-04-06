@@ -8,7 +8,7 @@ namespace GithubActors.Actors
     /// <summary>
     /// Top-level actor responsible for coordinating and launching repo-processing jobs
     /// </summary>
-    public class GithubCommanderActor : ReceiveActor
+    public class GithubCommanderActor : ReceiveActor, IWithUnboundedStash
     {
         #region Message classes
 
@@ -46,35 +46,87 @@ namespace GithubActors.Actors
 
         private IActorRef _coordinator;
         private IActorRef _canAcceptJobSender;
+        private RepoKey _repoJob;
+        public IStash Stash { get; set; }
+
+        private int pendingJobReplies;
 
         public GithubCommanderActor()
+        { 
+            Ready();
+        }
+
+        private void Ready()
         {
             Receive<CanAcceptJob>(job =>
             {
-                _canAcceptJobSender = Sender;
                 _coordinator.Tell(job);
+                _repoJob = job.Repo;
+                BecomeAsking();
             });
+        }
+
+        private void BecomeAsking()
+        {
+            _canAcceptJobSender = Sender;
+            // ask the router for the number of routees
+            pendingJobReplies = _coordinator.Ask<Routees>(new GetRoutees())
+                .Result.Members.Count();
+            Become(Asking);
+
+            // send ourselves a ReceiveTimeout message if no msg within 3 sec
+            Context.SetReceiveTimeout(TimeSpan.FromSeconds(3));
+        }
+
+        private void Asking()
+        {
+            Receive<CanAcceptJob>(job => Stash.Stash());
 
             Receive<UnableToAcceptJob>(job =>
             {
-                _canAcceptJobSender.Tell(job);
+                pendingJobReplies--;
+                if (pendingJobReplies == 0)
+                {
+                    _canAcceptJobSender.Tell(job);
+                    BecomeReady();
+                }
             });
 
             Receive<AbleToAcceptJob>(job =>
             {
                 _canAcceptJobSender.Tell(job);
 
-                //start processing messages
-                _coordinator.Tell(new GithubCoordinatorActor.BeginJob(job.Repo));
+                // start processing msgs
+                Sender.Tell(new GithubCoordinatorActor.BeginJob(job.Repo));
 
-                //launch the new window to view results of the processing
-                Context.ActorSelection(ActorPaths.MainFormActor.Path).Tell(new MainFormActor.LaunchRepoResultsWindow(job.Repo, Sender));
+                // launch new window to view results of processing
+                Context.ActorSelection(ActorPaths.MainFormActor.Path).Tell(
+                    new MainFormActor.LaunchRepoResultsWindow(job.Repo, Sender));
+
+                BecomeReady();
             });
+
+            Receive<ReceiveTimeout>(timeout =>
+            {
+                _canAcceptJobSender.Tell(new UnableToAcceptJob(_repoJob));
+                BecomeReady();
+            });
+        }
+
+        private void BecomeReady()
+        {
+            Become(Ready);
+            Stash.UnstashAll();
+
+            Context.SetReceiveTimeout(null);
         }
 
         protected override void PreStart()
         {
-            _coordinator = Context.ActorOf(Props.Create(() => new GithubCoordinatorActor()), ActorPaths.GithubCoordinatorActor.Name);
+            _coordinator = Context.ActorOf(Props.Create(() => new GithubCoordinatorActor())
+                .WithRouter(FromConfig.Instance), 
+                ActorPaths.GithubCoordinatorActor.Name);
+
             base.PreStart();
         }
 
